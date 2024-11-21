@@ -1,19 +1,16 @@
 
-# from mamba.head import MambaClassificationHead
-# from mamba.model import MambaTextClassification
-# from dataset import ImdbDataset
-# from utils import preprocess_function, compute_metrics
+from mamba.model import MambaTextClassification
+from MiniMamba.student import MambaStudent
+from dataset import ImdbDataset
+from utils import compute_metrics
 
 from datasets import load_dataset
-# from transformers import Trainer
 from transformers import AutoTokenizer, TrainingArguments
+from MiniMamba.distillation import DistillationTrainer
+
 
 # token = os.getenv("HUGGINGFACE_TOKEN") ---nn
 # login(token=token, write_permission=True)  ---- nn
-
-
-
-from MiniMamba.distillation import DistillationTrainer
 
 # ------- Load Teacher and Student
 
@@ -22,8 +19,15 @@ teacher_model = MambaTextClassification.from_pretrained("state-spaces/mamba-130m
 teacher_model.to("cuda")
 
 # Student 
-small_model = MambaTextClassification.from_pretrained("state-spaces/mamba-30m")  
-small_model.to("cuda")
+ student_model = MambaStudent.from_small_config(
+        device='cuda', 
+        num_classes=2,  # Binary classification
+        d_model=256,    # Adjust to fine-tune parameter count
+        n_layers=4
+    )
+
+# Count parameters
+count_parameters(model) # we are aiming for 10% of the parameters 
 
 
 # ----------- Import Tokenizer
@@ -58,7 +62,7 @@ training_args = TrainingArguments(
 )
 
 trainer = DistillationTrainer(
-    model=small_model,  # This is the student model
+    model=student_model,  
     tokenizer=tokenizer,
     args=training_args,
     train_dataset=subset_dataset,

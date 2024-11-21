@@ -16,7 +16,7 @@ class MambaTextClassification(MambaLMHeadModel):
         device = None,
         dtype = None,
     ) -> None:
-        super().__init__(config, initializer_cfg, device, dtype)
+        super().__init__(config, initializer_cfg, device, dtype) # ----- this needs to be changed for the student
         
         # Create a classification head using MambaClassificationHead with input size of d_model and number of classes 2.
         self.classification_head = MambaClassificationHead(d_model=config.d_model, num_classes=2)
@@ -40,7 +40,7 @@ class MambaTextClassification(MambaLMHeadModel):
             ClassificationOutput = namedtuple("ClassificationOutput", ["loss", "logits"])
             
             # Use CrossEntropyLoss loss function to compute the loss.
-            loss_fct = nn.CrossEntropyLoss()
+            loss_fct = nn.CrossEntropyLoss()  # ------------------------ I think this is the part we need to change for the student
             loss = loss_fct(logits, labels)
             
             return ClassificationOuptput(loss = loss, logits = logits)
