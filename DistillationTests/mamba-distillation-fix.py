@@ -8,75 +8,21 @@ from transformers import (
     AutoConfig,
     TrainingArguments,
     Trainer,
-    DataCollatorWithPadding
+    DataCollatorForLanguageModeling
 )
-from torch.nn import KLDivLoss
-import tensorflow as tf
-from typing import Dict, List
-import matplotlib.pyplot as plt
-from sklearn.metrics import mean_squared_error
-from scipy.stats import pearsonr
-import wandb
 from tqdm import tqdm
-
-import os
-import torch
-from datasets import load_dataset
-from transformers import (
-    AutoTokenizer, 
-    AutoModelForCausalLM,
-    AutoConfig,
-    TrainingArguments,
-    Trainer,
-    DataCollatorWithPadding
-)
-from torch.nn import KLDivLoss
-import tensorflow as tf
-
-import os
-import torch
-from datasets import load_dataset
-from transformers import (
-    AutoTokenizer, 
-    AutoModelForCausalLM,
-    AutoConfig,
-    TrainingArguments,
-    Trainer,
-    DataCollatorForLanguageModeling
-)
-from torch.nn import KLDivLoss
-import tensorflow as tf
-
-import os
-import torch
-import numpy as np
-from datasets import load_dataset
-from transformers import (
-    AutoTokenizer, 
-    AutoModelForCausalLM,
-    AutoConfig,
-    TrainingArguments,
-    Trainer,
-    DataCollatorForLanguageModeling
-)
-
-import os
-import torch
-import numpy as np
-from datasets import load_dataset
-from transformers import (
-    AutoTokenizer, 
-    AutoModelForCausalLM,
-    AutoConfig,
-    TrainingArguments,
-    Trainer,
-    DataCollatorForLanguageModeling
-)
 
 # Define the model and dataset
 MODEL_ID = "state-spaces/mamba-130m-hf"
 DATASET_NAME = "Abirate/english_quotes"
 SAVE_DIR = "./distilled_mamba_english_quotes"
+
+
+if torch.backends.mps.is_available():
+    #device = torch.device("mps")
+    device = torch.device("cpu")
+else:
+    device = torch.device("cpu")
 
 # Load tokenizer and model
 print("Loading tokenizer and model...")
@@ -88,11 +34,11 @@ if tokenizer.pad_token is None:
     tokenizer.pad_token_id = tokenizer.eos_token_id
 
 teacher_model = AutoModelForCausalLM.from_pretrained(MODEL_ID)
-
+teacher_model.to(device)
 # Load and preprocess dataset
 print("Loading and preprocessing dataset...")
 dataset = load_dataset(DATASET_NAME, split="train")
-subset_dataset = dataset.select(range(100))
+subset_dataset = dataset.select(range(1))
 
 def preprocess_function(examples):
     """
@@ -147,6 +93,7 @@ config.num_hidden_layers = max(1, config.num_hidden_layers // 8)
 
 # Create student model with modified config
 student_model = AutoModelForCausalLM.from_config(config)
+student_model.to(device)
 
 def distillation_loss(student_logits, teacher_logits, labels, temperature=2.0, alpha=0.5):
     """
@@ -254,25 +201,6 @@ print("Saving distilled model...")
 student_model.save_pretrained(SAVE_DIR)
 tokenizer.save_pretrained(SAVE_DIR)
 
-import os
-import torch
-import numpy as np
-from datasets import load_dataset
-from transformers import (
-    AutoTokenizer, 
-    AutoModelForCausalLM,
-    AutoConfig,
-    TrainingArguments,
-    Trainer,
-    DataCollatorForLanguageModeling
-)
-from tqdm import tqdm
-
-# Define the model and dataset
-MODEL_ID = "state-spaces/mamba-130m-hf"
-DATASET_NAME = "Abirate/english_quotes"
-SAVE_DIR = "./distilled_mamba_english_quotes"
-
 # Load tokenizer and model
 print("Loading tokenizer and model...")
 tokenizer = AutoTokenizer.from_pretrained(MODEL_ID)
@@ -342,6 +270,9 @@ class ModelEvaluator:
         self.device = device
         self.data_collator = data_collator
         
+        # Move models to the appropriate device
+        self.teacher_model.to(device)
+        self.student_model.to(device)
         # Set models to evaluation mode
         self.teacher_model.eval()
         self.student_model.eval()
@@ -351,9 +282,15 @@ class ModelEvaluator:
 
     def compute_perplexity(self, model, input_ids, attention_mask, labels):
         """Compute perplexity for a batch of inputs."""
+        # Move inputs to the same device as the model
+        device = next(model.parameters()).device
+        input_ids = input_ids.to(device)
+        attention_mask = attention_mask.to(device)
+        labels = labels.to(device)
+        
         with torch.no_grad():
             outputs = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
-            return torch.exp(outputs.loss).item()
+        return torch.exp(outputs.loss).item()
 
     def compute_activation_similarity(self, teacher_activations, student_activations):
         """Compute CKA similarity between activations."""
@@ -379,6 +316,8 @@ class ModelEvaluator:
     def get_hidden_states(self, model, input_ids, attention_mask):
         """Extract hidden states from the model."""
         with torch.no_grad():
+            input_ids = input_ids.to(device)
+            attention_mask = attention_mask.to(device)
             outputs = model(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
