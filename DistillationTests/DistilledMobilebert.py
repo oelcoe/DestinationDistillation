@@ -130,15 +130,6 @@ distillation_trainer = DistillationTrainer(
 distillation_trainer.train()
 distillation_trainer.evaluate()
 
-trainer_student = Trainer(
-    model=teacher_model,
-    args=training_args,
-    train_dataset=train_dataset,
-    eval_dataset=validation_dataset,
-    tokenizer=tokenizer,
-    data_collator=data_collator,
-    compute_metrics=compute_metrics,
-)
 # Save the student model
 student_model.save_pretrained("./transformers_student")
 tokenizer.save_pretrained("./transformers_student")
