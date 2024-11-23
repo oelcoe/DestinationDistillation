@@ -168,8 +168,13 @@ class MambaDistillationTrainer(Trainer):
     def __init__(self, *args, teacher_model=None, **kwargs):
         super().__init__(*args, **kwargs)
         self.teacher_model = teacher_model
+        self.step_count = 0
         
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
+        self.step_count += 1
+        if self.step_count % 10 == 0:  # Log every 10 steps
+            print(f"\nTraining step: {self.step_count}")
+        
         if self.teacher_model.device != model.device:
             self.teacher_model = self.teacher_model.to(model.device)
             
@@ -197,21 +202,15 @@ class MambaDistillationTrainer(Trainer):
             alpha=0.5
         )
         
+        # Log loss value occasionally
+        if self.step_count % 10 == 0:
+            print(f"Current loss: {loss.item():.4f}")
+        
         inputs["labels"] = labels
         
         if return_outputs:
             return loss, student_outputs
         return loss
-
-    def compute_metrics(self, eval_preds):
-        """Compute classification metrics."""
-        predictions, labels = eval_preds
-        predictions = np.argmax(predictions, axis=1)
-        
-        return {
-            'accuracy': accuracy_score(labels, predictions),
-            'f1': f1_score(labels, predictions, average='weighted')
-        }
 
 def main():
     # Load tokenizer
@@ -243,12 +242,15 @@ def main():
     dataset = load_dataset(DATASET_NAME, split="train")
     eval_dataset = load_dataset(DATASET_NAME, split="test")
 
+    dataset = dataset.select(range(1000))  # Use only 1000 examples for testing
+    eval_dataset = eval_dataset.select(range(200))
+
     def preprocess_function(examples):
         tokenized = tokenizer(
             examples["text"],
             padding='max_length',
             truncation=True,
-            max_length=128,
+            max_length=64,
             return_tensors=None,
             return_attention_mask=True
         )
@@ -279,12 +281,12 @@ def main():
         per_device_eval_batch_size=8,
         gradient_accumulation_steps=2,
         learning_rate=1e-4,
-        num_train_epochs=3,
+        num_train_epochs=1,  # Reduced for testing
         evaluation_strategy="steps",
-        eval_steps=100,
-        save_steps=500,
+        eval_steps=50,       # More frequent evaluation
+        save_steps=100,      # More frequent saving
         logging_dir="./logs",
-        logging_steps=50,
+        logging_steps=10,    # More frequent logging
         load_best_model_at_end=True,
         metric_for_best_model="accuracy",
         save_total_limit=2,
