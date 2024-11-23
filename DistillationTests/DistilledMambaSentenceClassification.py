@@ -134,7 +134,7 @@ def create_dataset(dataset_name, tokenizer, split="train", max_length=64, use_su
     """Create a properly formatted dataset."""
     # Load dataset
     if use_subset:
-        dataset = load_dataset(dataset_name, split=f"{split}[:20%]")
+        dataset = load_dataset(dataset_name, split=f"{split}[:1%]")
     else:
         dataset = load_dataset(dataset_name, split=split)
     
@@ -385,9 +385,9 @@ class TeacherTrainer:
                 batch = {k: v.to(self.device) for k, v in batch.items()}
                 outputs = self.model(**batch)
                 predictions = outputs.logits.argmax(dim=-1)
+
                 total_correct += (predictions == batch['labels']).sum().item()
                 total_samples += batch['labels'].size(0)
-        
         return total_correct / total_samples
     
     def save_model(self):
