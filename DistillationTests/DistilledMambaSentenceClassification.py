@@ -162,6 +162,7 @@ class OptimizedDistillationTrainer:
         eval_dataloader,
         num_epochs,
         device,
+        num_labels,
         learning_rate=1e-4,
         weight_decay=0.01,
         gradient_accumulation_steps=1
@@ -173,6 +174,7 @@ class OptimizedDistillationTrainer:
         self.num_epochs = num_epochs
         self.device = device
         self.gradient_accumulation_steps = gradient_accumulation_steps
+        self.num_labels = num_labels
         
         # Optimizer
         self.optimizer = torch.optim.AdamW(
@@ -394,6 +396,71 @@ class TeacherTrainer:
         os.makedirs(SAVE_DIR, exist_ok=True)
         torch.save(self.model.state_dict(), os.path.join(SAVE_DIR, 'best_teacher.pth'))
 
+def count_parameters(model):
+    """Count trainable and total parameters in a model."""
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    total_params = sum(p.numel() for p in model.parameters())
+    
+    # Count parameters by component
+    mamba_params = sum(p.numel() for p in model.mamba.parameters())
+    projection_params = sum(p.numel() for p in model.projection.parameters())
+    classifier_params = sum(p.numel() for p in model.classifier.parameters())
+    
+    size_mb = total_params * 4 / (1024 * 1024)  # Size in MB (assuming float32)
+    
+    return {
+        'trainable': trainable_params,
+        'total': total_params,
+        'mamba_base': mamba_params,
+        'projection': projection_params,
+        'classifier': classifier_params,
+        'size_mb': size_mb
+    }
+
+def compare_models(teacher_model, student_model):
+    """Compare and display model sizes."""
+    teacher_params = count_parameters(teacher_model)
+    student_params = count_parameters(student_model)
+    
+    print("\nModel Size Comparison:")
+    print("\nTeacher Model:")
+    print(f"Total Parameters: {teacher_params['total']:,}")
+    print(f"Trainable Parameters: {teacher_params['trainable']:,}")
+    print(f"Model Size: {teacher_params['size_mb']:.2f} MB")
+    print("\nParameter distribution:")
+    print(f"- Mamba base: {teacher_params['mamba_base']:,}")
+    print(f"- Projection layer: {teacher_params['projection']:,}")
+    print(f"- Classifier: {teacher_params['classifier']:,}")
+    
+    print("\nStudent Model:")
+    print(f"Total Parameters: {student_params['total']:,}")
+    print(f"Trainable Parameters: {student_params['trainable']:,}")
+    print(f"Model Size: {student_params['size_mb']:.2f} MB")
+    print("\nParameter distribution:")
+    print(f"- Mamba base: {student_params['mamba_base']:,}")
+    print(f"- Projection layer: {student_params['projection']:,}")
+    print(f"- Classifier: {student_params['classifier']:,}")
+    
+    reduction_ratio = teacher_params['total'] / student_params['total']
+    size_reduction = (1 - student_params['total'] / teacher_params['total']) * 100
+    
+    print("\nReduction Statistics:")
+    print(f"Reduction Ratio: {reduction_ratio:.2f}x")
+    print(f"Size Reduction: {size_reduction:.2f}%")
+
+def create_reduced_mamba_config(teacher_config):
+    """Create a properly reduced configuration for the student model."""
+    student_config = AutoConfig.from_pretrained(MODEL_ID)
+    
+    # Reduce all relevant dimensions
+    student_config.d_model = teacher_config.d_model // 2        # Hidden size
+    student_config.n_layer = max(1, teacher_config.n_layer // 2)  # Number of layers
+    student_config.d_state = teacher_config.d_state // 2        # State dimension
+    student_config.d_conv = max(4, teacher_config.d_conv // 2)  # Conv dimension
+    student_config.expand = max(1, teacher_config.expand // 2)  # Expansion factor
+    
+    return student_config
+
 def main():
     # Load tokenizer
     print("Loading tokenizer...")
@@ -422,10 +489,37 @@ def main():
         num_workers=0
     )
 
-    # Create teacher model for fine-tuning
+    # Create teacher model
     print("Creating teacher model...")
     base_teacher = AutoModelForCausalLM.from_pretrained(MODEL_ID)
     teacher_model = MambaForSequenceClassification(base_teacher, NUM_LABELS)
+    teacher_model = teacher_model.to(device)
+    
+    # Print teacher model's configuration
+    print("\nTeacher Model Configuration:")
+    print(f"d_model: {base_teacher.config.d_model}")
+    print(f"n_layer: {base_teacher.config.n_layer}")
+    print(f"d_state: {base_teacher.config.d_state}")
+    print(f"d_conv: {base_teacher.config.d_conv}")
+    print(f"expand: {base_teacher.config.expand}")
+    
+    # Create properly reduced student model
+    print("\nCreating student model...")
+    student_config = create_reduced_mamba_config(base_teacher.config)
+    base_student = AutoModelForCausalLM.from_config(student_config)
+    student_model = MambaForSequenceClassification(base_student, NUM_LABELS)
+    student_model = student_model.to(device)
+    
+    # Print student model's configuration
+    print("\nStudent Model Configuration:")
+    print(f"d_model: {base_student.config.d_model}")
+    print(f"n_layer: {base_student.config.n_layer}")
+    print(f"d_state: {base_student.config.d_state}")
+    print(f"d_conv: {base_student.config.d_conv}")
+    print(f"expand: {base_student.config.expand}")
+    
+    # Compare model sizes
+    compare_models(teacher_model, student_model)
     
     # Fine-tune teacher model
     print("\nFine-tuning teacher model...")
@@ -445,20 +539,6 @@ def main():
     # Load best teacher model
     teacher_model.load_state_dict(torch.load(os.path.join(SAVE_DIR, 'best_teacher.pth')))
     teacher_model.eval()  # Set to evaluation mode
-    
-    # Create student model
-    print("\nCreating student model...")
-    student_config = AutoConfig.from_pretrained(MODEL_ID)
-    student_config.d_model = student_config.d_model // 2
-    student_config.n_layer = max(1, student_config.n_layer // 4)
-    base_student = AutoModelForCausalLM.from_config(student_config)
-    student_model = MambaForSequenceClassification(base_student, NUM_LABELS)
-    student_model = student_model.to(device)
-    
-    print("\nTeacher model dimensions:")
-    print(f"Hidden size: {teacher_model.hidden_size}")
-    print("\nStudent model dimensions:")
-    print(f"Hidden size: {student_model.hidden_size}")
 
     # Initialize distillation trainer
     print("\nStarting distillation...")
@@ -469,6 +549,7 @@ def main():
         eval_dataloader=eval_dataloader,
         num_epochs=3,
         device=device,
+        num_labels=NUM_LABELS,
         learning_rate=1e-4,
         gradient_accumulation_steps=2
     )
