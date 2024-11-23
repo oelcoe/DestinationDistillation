@@ -20,6 +20,14 @@ MODEL_ID = "state-spaces/mamba-130m-hf"
 DATASET_NAME = "dair-ai/emotion"
 NUM_LABELS = 6
 SAVE_DIR = "./distilled_mamba_classifier"
+EMOTION_LABELS = {
+    0: "sadness",
+    1: "joy",
+    2: "love",
+    3: "anger",
+    4: "fear",
+    5: "surprise"
+}
 
 # Device setup
 def get_device():
@@ -249,16 +257,31 @@ class OptimizedDistillationTrainer:
         self.student_model.eval()
         total_correct = 0
         total_samples = 0
+        label_counts = {i: 0 for i in range(self.num_labels)}  # Track predictions per class
         
         with torch.no_grad():
             for batch in self.eval_dataloader:
                 batch = {k: v.to(self.device) for k, v in batch.items()}
                 outputs = self.student_model(**batch)
                 predictions = outputs.logits.argmax(dim=-1)
+                
+                # Count predictions per class
+                for pred in predictions.cpu().numpy():
+                    label_counts[pred] += 1
+                
                 total_correct += (predictions == batch['labels']).sum().item()
                 total_samples += batch['labels'].size(0)
         
-        return total_correct / total_samples
+        accuracy = total_correct / total_samples
+        
+        # Print distribution of predictions
+        print("\nPrediction distribution:")
+        for label_id, count in label_counts.items():
+            percentage = (count / total_samples) * 100
+            emotion = EMOTION_LABELS[label_id]
+            print(f"{emotion}: {count} predictions ({percentage:.2f}%)")
+        
+        return accuracy
     
     def save_model(self):
         os.makedirs(SAVE_DIR, exist_ok=True)
@@ -453,33 +476,88 @@ def main():
     # Train student through distillation
     distillation_trainer.train()
 
-    # Test both models
-    def predict_text(text, model, tokenizer, device):
-        inputs = tokenizer(text, return_tensors="pt", padding=True, truncation=True)
-        inputs = {k: v.to(device) for k, v in inputs.items()}
-        
-        with torch.no_grad():
-            outputs = model(**inputs)
-            probs = F.softmax(outputs.logits, dim=-1)
-            prediction = torch.argmax(probs, dim=-1)
-        
-        return prediction.item(), probs[0].cpu().numpy()
-
-    # Test examples
+    # Test examples with emotion labels
     test_texts = [
         "I feel happy today!",
         "This makes me so angry!",
         "I'm really sad about what happened.",
-        "What an amazing surprise!"
+        "What an amazing surprise!",
+        "I love you so much!",
+        "This is terrifying!"
     ]
     
     print("\nTesting both models:")
     for text in test_texts:
         print(f"\nText: {text}")
+        
+        # Teacher prediction
         teacher_pred, teacher_probs = predict_text(text, teacher_model, tokenizer, device)
+        teacher_emotion = EMOTION_LABELS[teacher_pred]
+        print(f"Teacher prediction: {teacher_emotion} (confidence: {teacher_probs[teacher_pred]:.4f})")
+        print("Teacher probabilities for each emotion:")
+        for i, prob in enumerate(teacher_probs):
+            print(f"  {EMOTION_LABELS[i]}: {prob:.4f}")
+        
+        # Student prediction
         student_pred, student_probs = predict_text(text, student_model, tokenizer, device)
-        print(f"Teacher prediction: {teacher_pred} (confidence: {teacher_probs[teacher_pred]:.4f})")
-        print(f"Student prediction: {student_pred} (confidence: {student_probs[student_pred]:.4f})")
+        student_emotion = EMOTION_LABELS[student_pred]
+        print(f"Student prediction: {student_emotion} (confidence: {student_probs[student_pred]:.4f})")
+        print("Student probabilities for each emotion:")
+        for i, prob in enumerate(student_probs):
+            print(f"  {EMOTION_LABELS[i]}: {prob:.4f}")
+
+    # Print overall statistics
+    print("\nOverall Prediction Statistics:")
+    print("\nEvaluating Teacher Model...")
+    teacher_model.eval()
+    label_counts = {i: 0 for i in range(NUM_LABELS)}
+    total_samples = 0
+    
+    with torch.no_grad():
+        for batch in eval_dataloader:
+            batch = {k: v.to(device) for k, v in batch.items()}
+            outputs = teacher_model(**batch)
+            predictions = outputs.logits.argmax(dim=-1)
+            
+            for pred in predictions.cpu().numpy():
+                label_counts[pred] += 1
+            total_samples += predictions.size(0)
+    
+    print("\nTeacher Model Distribution:")
+    for label_id, count in label_counts.items():
+        percentage = (count / total_samples) * 100
+        emotion = EMOTION_LABELS[label_id]
+        print(f"{emotion}: {count} predictions ({percentage:.2f}%)")
+    
+    print("\nEvaluating Student Model...")
+    student_model.eval()
+    label_counts = {i: 0 for i in range(NUM_LABELS)}
+    
+    with torch.no_grad():
+        for batch in eval_dataloader:
+            batch = {k: v.to(device) for k, v in batch.items()}
+            outputs = student_model(**batch)
+            predictions = outputs.logits.argmax(dim=-1)
+            
+            for pred in predictions.cpu().numpy():
+                label_counts[pred] += 1
+    
+    print("\nStudent Model Distribution:")
+    for label_id, count in label_counts.items():
+        percentage = (count / total_samples) * 100
+        emotion = EMOTION_LABELS[label_id]
+        print(f"{emotion}: {count} predictions ({percentage:.2f}%)")
+
+def predict_text(text, model, tokenizer, device):
+    inputs = tokenizer(text, return_tensors="pt", padding=True, truncation=True)
+    inputs = {k: v.to(device) for k, v in inputs.items()}
+    
+    with torch.no_grad():
+        outputs = model(**inputs)
+        probs = F.softmax(outputs.logits, dim=-1)
+        prediction = torch.argmax(probs, dim=-1)
+    
+    return prediction.item(), probs[0].cpu().numpy()
 
 if __name__ == "__main__":
     main()
