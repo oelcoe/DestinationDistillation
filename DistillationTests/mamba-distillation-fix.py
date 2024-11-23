@@ -38,7 +38,7 @@ teacher_model.to(device)
 # Load and preprocess dataset
 print("Loading and preprocessing dataset...")
 dataset = load_dataset(DATASET_NAME, split="train")
-subset_dataset = dataset.select(range(1))
+subset_dataset = dataset#.select(range(10))
 
 def preprocess_function(examples):
     """
@@ -276,18 +276,18 @@ class ModelEvaluator:
         # Set models to evaluation mode
         self.teacher_model.eval()
         self.student_model.eval()
-        
         # Initialize metrics dictionary
         self.metrics = {}
 
     def compute_perplexity(self, model, input_ids, attention_mask, labels):
         """Compute perplexity for a batch of inputs."""
-        # Move inputs to the same device as the model
-        device = next(model.parameters()).device
         input_ids = input_ids.to(device)
         attention_mask = attention_mask.to(device)
         labels = labels.to(device)
-        
+        model.to(device)
+        print(f"Teacher model device: {model.device}")
+        print(f"Attention device: {attention_mask.device}")
+        print(f"Input tensor device: {input_ids.device}")
         with torch.no_grad():
             outputs = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
         return torch.exp(outputs.loss).item()
@@ -346,12 +346,14 @@ class ModelEvaluator:
             
             # Generate predictions
             with torch.no_grad():
+                teacher_model.to(self.device)
                 teacher_output = self.teacher_model.generate(
                     batch['input_ids'], 
                     max_new_tokens=10,
                     num_return_sequences=1,
                     attention_mask=batch['attention_mask']
                 )
+                student_model.to(self.device)
                 student_output = self.student_model.generate(
                     batch['input_ids'],
                     max_new_tokens=10,
@@ -462,7 +464,7 @@ def evaluate_and_log_metrics(teacher_model, student_model, tokenizer, eval_datas
     
     return metrics
 
-# Evaluation
+# Evaluation TODO: Debug this
 eval_metrics = evaluate_and_log_metrics(
     teacher_model,
     student_model,
@@ -471,3 +473,14 @@ eval_metrics = evaluate_and_log_metrics(
     training_args.device,
     data_collator
 )
+
+input_ids = tokenizer("Hello, who is this?", return_tensors= "pt")["input_ids"]
+input_ids = input_ids.to(device)
+student_model.to(device)
+teacher_model.to(device)
+out = teacher_model.generate(input_ids, max_new_tokens=20)
+print("Original Model")
+print(tokenizer.batch_decode(out))
+out = student_model.generate(input_ids, max_new_tokens=20)
+print("Distilled Model")
+print(tokenizer.batch_decode(out))
