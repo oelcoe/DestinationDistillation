@@ -35,6 +35,7 @@ if tokenizer.pad_token is None:
 
 teacher_model = AutoModelForCausalLM.from_pretrained(MODEL_ID)
 teacher_model.to(device)
+
 # Load and preprocess dataset
 print("Loading and preprocessing dataset...")
 dataset = load_dataset(DATASET_NAME, split="train")

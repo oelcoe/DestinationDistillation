@@ -4,13 +4,14 @@ import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
 from tqdm import tqdm
-from sklearn.metrics import accuracy_score, f1_score, classification_report
+from sklearn.metrics import accuracy_score, f1_score
 from transformers import (
     AutoTokenizer, 
     AutoModelForCausalLM,
     AutoConfig,
     TrainingArguments,
-    Trainer
+    Trainer,
+    get_scheduler
 )
 from datasets import load_dataset
 
@@ -39,86 +40,62 @@ class MambaForSequenceClassification(nn.Module):
         self.num_labels = num_labels
         self.pooling_type = pooling_type
         
+        # Freeze most of the base model layers for fine-tuning
+        # Only fine-tune the last few layers
+        total_layers = len(list(base_model.parameters()))
+        for param in list(base_model.parameters())[:(total_layers - 2)]:
+            param.requires_grad = False
+        
         # Get hidden size from model config
         self.hidden_size = self.mamba.config.d_model
         
-        # Project from vocab size to hidden size
+        # Create projection layer
         self.projection = nn.Linear(self.mamba.config.vocab_size, self.hidden_size)
         
         # Classification head
         self.classifier = nn.Sequential(
-            nn.Linear(self.hidden_size, self.hidden_size),
+            nn.Linear(self.hidden_size, self.hidden_size // 2),
             nn.GELU(),
             nn.Dropout(0.1),
-            nn.Linear(self.hidden_size, num_labels)
+            nn.Linear(self.hidden_size // 2, num_labels)
         )
         
-        print(f"Model initialized with:")
+        print(f"\nModel initialized with:")
         print(f"- Hidden size: {self.hidden_size}")
         print(f"- Vocab size: {self.mamba.config.vocab_size}")
-        print(f"- Projection: {self.mamba.config.vocab_size} -> {self.hidden_size}")
-        
+        print(f"- Number of layers: {self.mamba.config.n_layer}")
+        print("- Fine-tuning last 2 layers of base model + classifier")
+    
     def forward(self, input_ids, attention_mask=None, labels=None):
-        device = self.device
-        input_ids = input_ids.to(device)
-        if attention_mask is not None:
-            attention_mask = attention_mask.to(device)
-        if labels is not None:
-            labels = labels.to(device)
-            
-        # Get hidden states from Mamba
+        # Get Mamba output
         outputs = self.mamba(input_ids, attention_mask=attention_mask)
-        hidden_states = outputs.logits  # Shape: [batch_size, seq_len, vocab_size]
+        hidden_states = outputs.logits
         
-        # Debug shapes
-        if self.training and not hasattr(self, '_printed_shapes'):
-            print(f"\nDebug shapes in forward pass:")
-            print(f"Initial hidden states shape: {hidden_states.shape}")
-            self._printed_shapes = True
-            
-        # Apply pooling before projection
+        # Apply pooling
         if self.pooling_type == 'mean':
             if attention_mask is not None:
                 mask_expanded = attention_mask.unsqueeze(-1).float()
-                sum_hidden = torch.sum(hidden_states * mask_expanded, dim=1)
-                sum_mask = torch.sum(mask_expanded, dim=1)
-                pooled_output = sum_hidden / (sum_mask + 1e-9)
+                pooled_output = (hidden_states * mask_expanded).sum(dim=1) / mask_expanded.sum(dim=1).clamp(min=1e-9)
             else:
-                pooled_output = torch.mean(hidden_states, dim=1)
-        elif self.pooling_type == 'max':
+                pooled_output = hidden_states.mean(dim=1)
+        else:  # max pooling
             if attention_mask is not None:
                 mask_expanded = attention_mask.unsqueeze(-1).float()
                 hidden_states = hidden_states * mask_expanded - 1e9 * (1 - mask_expanded)
-            pooled_output = torch.max(hidden_states, dim=1)[0]
-        else:
-            pooled_output = hidden_states[:, -1]
-            
-        # Debug pooled shape
-        if self.training and not hasattr(self, '_printed_pooled'):
-            print(f"Pooled shape before projection: {pooled_output.shape}")
-            self._printed_pooled = True
-            
-        # Project from vocab size to hidden size
-        projected_output = self.projection(pooled_output)
+            pooled_output = hidden_states.max(dim=1)[0]
         
-        # Debug projected shape
-        if self.training and not hasattr(self, '_printed_projected'):
-            print(f"Projected output shape: {projected_output.shape}")
-            self._printed_projected = True
-            
-        # Apply classification head
-        logits = self.classifier(projected_output)
+        # Project and classify
+        projected = self.projection(pooled_output)
+        logits = self.classifier(projected)
         
-        # Calculate loss if labels are provided
+        # Compute loss if needed
         loss = None
         if labels is not None:
-            loss_fct = nn.CrossEntropyLoss()
-            loss = loss_fct(logits.view(-1, self.num_labels), labels.view(-1))
+            loss = F.cross_entropy(logits, labels)
         
         return type('MambaSequenceClassifierOutput', (), {
             'loss': loss,
-            'logits': logits,
-            'hidden_states': hidden_states
+            'logits': logits
         })
 
     @property
@@ -132,191 +109,351 @@ class MambaForSequenceClassification(nn.Module):
         self.classifier = self.classifier.to(device)
         return self
 
-def create_student_model(teacher_model, num_labels):
-    """Create a properly sized student model."""
-    # Create a new config instead of copying
-    student_config = AutoConfig.from_pretrained(MODEL_ID)
+class CustomDataset(torch.utils.data.Dataset):
+    def __init__(self, encodings, labels):
+        self.encodings = encodings
+        self.labels = labels
+
+    def __getitem__(self, idx):
+        item = {key: torch.tensor(val[idx]) for key, val in self.encodings.items()}
+        item['labels'] = torch.tensor(self.labels[idx])
+        return item
+
+    def __len__(self):
+        return len(self.labels)
+
+def create_dataset(dataset_name, tokenizer, split="train", max_length=64, use_subset=True):
+    """Create a properly formatted dataset."""
+    # Load dataset
+    if use_subset:
+        dataset = load_dataset(dataset_name, split=f"{split}[:20%]")
+    else:
+        dataset = load_dataset(dataset_name, split=split)
     
-    # Modify the config for student model
-    student_config.d_model = teacher_model.mamba.config.d_model // 2
-    student_config.n_layer = max(1, teacher_model.mamba.config.n_layer // 4)
-    
-    # Create base student model
-    base_student = AutoModelForCausalLM.from_config(student_config)
-    
-    # Create student model with same vocab size projection as teacher
-    student_model = MambaForSequenceClassification(
-        base_student, 
-        num_labels, 
-        pooling_type='mean'
+    # Tokenize texts
+    encodings = tokenizer(
+        dataset["text"],
+        padding='max_length',
+        truncation=True,
+        max_length=max_length,
+        return_tensors=None
     )
     
-    return student_model, student_config
-
-def distillation_loss(student_logits, teacher_logits, labels, temperature=2.0, alpha=0.5):
-    """Compute the distillation loss."""
-    if student_logits.size() != teacher_logits.size():
-        print(f"Warning: size mismatch - student: {student_logits.size()}, teacher: {teacher_logits.size()}")
+    # Get labels
+    labels = dataset["label"]
     
-    soft_targets = F.softmax(teacher_logits / temperature, dim=-1)
-    student_log_probs = F.log_softmax(student_logits / temperature, dim=-1)
-    soft_loss = -(soft_targets * student_log_probs).sum(dim=-1).mean()
-    hard_loss = F.cross_entropy(student_logits, labels)
-    return alpha * (temperature ** 2) * soft_loss + (1 - alpha) * hard_loss
+    # Create custom dataset
+    return CustomDataset(encodings, labels)
 
-class MambaDistillationTrainer(Trainer):
-    def __init__(self, *args, teacher_model=None, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.teacher_model = teacher_model
-        self.step_count = 0
+class OptimizedDistillationTrainer:
+    def __init__(
+        self,
+        teacher_model,
+        student_model,
+        train_dataloader,
+        eval_dataloader,
+        num_epochs,
+        device,
+        learning_rate=1e-4,
+        weight_decay=0.01,
+        gradient_accumulation_steps=1
+    ):
+        self.teacher_model = teacher_model.to(device)
+        self.student_model = student_model.to(device)
+        self.train_dataloader = train_dataloader
+        self.eval_dataloader = eval_dataloader
+        self.num_epochs = num_epochs
+        self.device = device
+        self.gradient_accumulation_steps = gradient_accumulation_steps
         
-    def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
-        self.step_count += 1
-        if self.step_count % 10 == 0:  # Log every 10 steps
-            print(f"\nTraining step: {self.step_count}")
-        
-        if self.teacher_model.device != model.device:
-            self.teacher_model = self.teacher_model.to(model.device)
-            
-        labels = inputs.pop("labels")
-        inputs = {k: v.to(model.device) for k, v in inputs.items()}
-        labels = labels.to(model.device)
-        
-        # Debug first batch
-        if not hasattr(self, '_printed_debug'):
-            print("\nDebugging first batch:")
-            print(f"Input shapes: {[(k, v.shape) for k, v in inputs.items()]}")
-            print(f"Labels shape: {labels.shape}")
-            self._printed_debug = True
-        
-        with torch.no_grad():
-            teacher_outputs = self.teacher_model(**inputs)
-        
-        student_outputs = model(**inputs)
-        
-        loss = distillation_loss(
-            student_outputs.logits,
-            teacher_outputs.logits,
-            labels,
-            temperature=2.0,
-            alpha=0.5
+        # Optimizer
+        self.optimizer = torch.optim.AdamW(
+            student_model.parameters(),
+            lr=learning_rate,
+            weight_decay=weight_decay
         )
         
-        # Log loss value occasionally
-        if self.step_count % 10 == 0:
-            print(f"Current loss: {loss.item():.4f}")
+        # Learning rate scheduler
+        num_training_steps = len(train_dataloader) * num_epochs
+        self.scheduler = get_scheduler(
+            "cosine",
+            optimizer=self.optimizer,
+            num_warmup_steps=num_training_steps // 10,
+            num_training_steps=num_training_steps
+        )
+
+    def compute_loss(self, student_logits, teacher_logits, labels, temperature=2.0, alpha=0.5):
+        """Compute the distillation loss."""
+        # Temperature scaling
+        student_scaled = student_logits / temperature
+        teacher_scaled = teacher_logits / temperature
         
-        inputs["labels"] = labels
+        # Compute soft targets once
+        soft_targets = F.softmax(teacher_scaled, dim=-1)
+        student_log_probs = F.log_softmax(student_scaled, dim=-1)
         
-        if return_outputs:
-            return loss, student_outputs
-        return loss
+        # Compute losses
+        soft_loss = -(soft_targets * student_log_probs).sum(dim=-1).mean()
+        hard_loss = F.cross_entropy(student_logits, labels)
+        
+        return alpha * (temperature ** 2) * soft_loss + (1 - alpha) * hard_loss
+
+    def train(self):
+        best_eval_acc = 0
+        for epoch in range(self.num_epochs):
+            self.student_model.train()
+            self.teacher_model.eval()
+            
+            total_loss = 0
+            progress_bar = tqdm(self.train_dataloader, desc=f"Epoch {epoch+1}")
+            
+            for step, batch in enumerate(progress_bar):
+                # Move batch to device
+                batch = {k: v.to(self.device) for k, v in batch.items()}
+                
+                # Get teacher predictions
+                with torch.no_grad():
+                    teacher_outputs = self.teacher_model(**batch)
+                
+                # Get student predictions and loss
+                student_outputs = self.student_model(**batch)
+                loss = self.compute_loss(
+                    student_outputs.logits,
+                    teacher_outputs.logits,
+                    batch['labels']
+                ) / self.gradient_accumulation_steps
+                
+                # Backward pass
+                loss.backward()
+                
+                # Gradient accumulation
+                if (step + 1) % self.gradient_accumulation_steps == 0:
+                    torch.nn.utils.clip_grad_norm_(self.student_model.parameters(), 1.0)
+                    self.optimizer.step()
+                    self.scheduler.step()
+                    self.optimizer.zero_grad()
+                
+                total_loss += loss.item() * self.gradient_accumulation_steps
+                progress_bar.set_postfix({'loss': total_loss / (step + 1)})
+            
+            # Evaluation
+            eval_acc = self.evaluate()
+            print(f"Epoch {epoch+1} - Eval Accuracy: {eval_acc:.4f}")
+            
+            # Save best model
+            if eval_acc > best_eval_acc:
+                best_eval_acc = eval_acc
+                self.save_model()
+    
+    def evaluate(self):
+        self.student_model.eval()
+        total_correct = 0
+        total_samples = 0
+        
+        with torch.no_grad():
+            for batch in self.eval_dataloader:
+                batch = {k: v.to(self.device) for k, v in batch.items()}
+                outputs = self.student_model(**batch)
+                predictions = outputs.logits.argmax(dim=-1)
+                total_correct += (predictions == batch['labels']).sum().item()
+                total_samples += batch['labels'].size(0)
+        
+        return total_correct / total_samples
+    
+    def save_model(self):
+        os.makedirs(SAVE_DIR, exist_ok=True)
+        torch.save(self.student_model.state_dict(), os.path.join(SAVE_DIR, 'best_model.pth'))
+
+class TeacherTrainer:
+    def __init__(
+        self,
+        model,
+        train_dataloader,
+        eval_dataloader,
+        num_epochs,
+        device,
+        learning_rate=5e-5,  # Lower learning rate for fine-tuning
+        weight_decay=0.01
+    ):
+        self.model = model.to(device)
+        self.train_dataloader = train_dataloader
+        self.eval_dataloader = eval_dataloader
+        self.num_epochs = num_epochs
+        self.device = device
+        
+        # Separate parameter groups for fine-tuning
+        # Higher learning rate for new layers, lower for pre-trained layers
+        classifier_params = list(model.classifier.parameters()) + list(model.projection.parameters())
+        pretrained_params = list(model.mamba.parameters())[-2:]  # Last two layers of base model
+        
+        self.optimizer = torch.optim.AdamW([
+            {'params': classifier_params, 'lr': learning_rate},
+            {'params': pretrained_params, 'lr': learning_rate * 0.1}  # Lower learning rate for pre-trained layers
+        ], weight_decay=weight_decay)
+        
+        # Learning rate scheduler with warm-up
+        num_training_steps = len(train_dataloader) * num_epochs
+        num_warmup_steps = num_training_steps // 10
+        
+        self.scheduler = get_scheduler(
+            "cosine",
+            optimizer=self.optimizer,
+            num_warmup_steps=num_warmup_steps,
+            num_training_steps=num_training_steps
+        )
+
+    def train(self):
+        best_eval_acc = 0
+        early_stopping_patience = 3
+        early_stopping_counter = 0
+        
+        for epoch in range(self.num_epochs):
+            self.model.train()
+            total_loss = 0
+            progress_bar = tqdm(self.train_dataloader, desc=f"Teacher Fine-tuning Epoch {epoch+1}")
+            
+            for step, batch in enumerate(progress_bar):
+                batch = {k: v.to(self.device) for k, v in batch.items()}
+                
+                outputs = self.model(**batch)
+                loss = outputs.loss
+                
+                loss.backward()
+                
+                # Gradient clipping
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+                
+                self.optimizer.step()
+                self.scheduler.step()
+                self.optimizer.zero_grad()
+                
+                total_loss += loss.item()
+                progress_bar.set_postfix({
+                    'loss': total_loss / (step + 1),
+                    'lr': self.scheduler.get_last_lr()[0]
+                })
+            
+            # Evaluation
+            eval_acc = self.evaluate()
+            print(f"Teacher Epoch {epoch+1} - Eval Accuracy: {eval_acc:.4f}")
+            
+            # Early stopping check
+            if eval_acc > best_eval_acc:
+                best_eval_acc = eval_acc
+                early_stopping_counter = 0
+                self.save_model()
+            else:
+                early_stopping_counter += 1
+            
+            if early_stopping_counter >= early_stopping_patience:
+                print("Early stopping triggered!")
+                break
+        
+        print(f"Best Teacher Accuracy: {best_eval_acc:.4f}")
+        return best_eval_acc
+    
+    def evaluate(self):
+        self.model.eval()
+        total_correct = 0
+        total_samples = 0
+        
+        with torch.no_grad():
+            for batch in self.eval_dataloader:
+                batch = {k: v.to(self.device) for k, v in batch.items()}
+                outputs = self.model(**batch)
+                predictions = outputs.logits.argmax(dim=-1)
+                total_correct += (predictions == batch['labels']).sum().item()
+                total_samples += batch['labels'].size(0)
+        
+        return total_correct / total_samples
+    
+    def save_model(self):
+        os.makedirs(SAVE_DIR, exist_ok=True)
+        torch.save(self.model.state_dict(), os.path.join(SAVE_DIR, 'best_teacher.pth'))
 
 def main():
     # Load tokenizer
     print("Loading tokenizer...")
     tokenizer = AutoTokenizer.from_pretrained(MODEL_ID)
-
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
         tokenizer.pad_token_id = tokenizer.eos_token_id
 
-    # Create teacher model
-    print("Creating models...")
-    base_teacher = AutoModelForCausalLM.from_pretrained(MODEL_ID)
-    teacher_model = MambaForSequenceClassification(base_teacher, NUM_LABELS, pooling_type='mean')
-    teacher_model = teacher_model.to(device)
+    # Create datasets
+    print("Creating datasets...")
+    train_dataset = create_dataset(DATASET_NAME, tokenizer, split="train")
+    eval_dataset = create_dataset(DATASET_NAME, tokenizer, split="test")
+
+    # Create dataloaders
+    train_dataloader = torch.utils.data.DataLoader(
+        train_dataset,
+        batch_size=8,
+        shuffle=True,
+        num_workers=0
+    )
     
-    # Create student model and get config
-    student_model, student_config = create_student_model(teacher_model, NUM_LABELS)
+    eval_dataloader = torch.utils.data.DataLoader(
+        eval_dataset,
+        batch_size=8,
+        shuffle=False,
+        num_workers=0
+    )
+
+    # Create teacher model for fine-tuning
+    print("Creating teacher model...")
+    base_teacher = AutoModelForCausalLM.from_pretrained(MODEL_ID)
+    teacher_model = MambaForSequenceClassification(base_teacher, NUM_LABELS)
+    
+    # Fine-tune teacher model
+    print("\nFine-tuning teacher model...")
+    teacher_trainer = TeacherTrainer(
+        model=teacher_model,
+        train_dataloader=train_dataloader,
+        eval_dataloader=eval_dataloader,
+        num_epochs=10,  # More epochs for fine-tuning
+        device=device
+    )
+    
+    best_teacher_acc = teacher_trainer.train()
+    
+    best_teacher_acc = teacher_trainer.train()
+    print(f"\nTeacher training completed. Best accuracy: {best_teacher_acc:.4f}")
+    
+    # Load best teacher model
+    teacher_model.load_state_dict(torch.load(os.path.join(SAVE_DIR, 'best_teacher.pth')))
+    teacher_model.eval()  # Set to evaluation mode
+    
+    # Create student model
+    print("\nCreating student model...")
+    student_config = AutoConfig.from_pretrained(MODEL_ID)
+    student_config.d_model = student_config.d_model // 2
+    student_config.n_layer = max(1, student_config.n_layer // 4)
+    base_student = AutoModelForCausalLM.from_config(student_config)
+    student_model = MambaForSequenceClassification(base_student, NUM_LABELS)
     student_model = student_model.to(device)
     
-    # Print model dimensions
     print("\nTeacher model dimensions:")
     print(f"Hidden size: {teacher_model.hidden_size}")
     print("\nStudent model dimensions:")
     print(f"Hidden size: {student_model.hidden_size}")
 
-    # Load and preprocess dataset
-    print("Loading dataset...")
-    dataset = load_dataset(DATASET_NAME, split="train")
-    eval_dataset = load_dataset(DATASET_NAME, split="test")
-
-    dataset = dataset.select(range(1000))  # Use only 1000 examples for testing
-    eval_dataset = eval_dataset.select(range(200))
-
-    def preprocess_function(examples):
-        tokenized = tokenizer(
-            examples["text"],
-            padding='max_length',
-            truncation=True,
-            max_length=64,
-            return_tensors=None,
-            return_attention_mask=True
-        )
-        
-        # Make sure to convert labels to the correct format
-        tokenized["labels"] = examples["label"]
-        
-        return tokenized
-
-    processed_dataset = dataset.map(
-        preprocess_function,
-        batched=True,
-        remove_columns=['text'],
-        desc="Processing train dataset"
-    )
-
-    processed_eval_dataset = eval_dataset.map(
-        preprocess_function,
-        batched=True,
-        remove_columns=['text'],
-        desc="Processing eval dataset"
-    )
-
-    # Training arguments
-    training_args = TrainingArguments(
-        output_dir=SAVE_DIR,
-        per_device_train_batch_size=8,
-        per_device_eval_batch_size=8,
-        gradient_accumulation_steps=2,
-        learning_rate=1e-4,
-        num_train_epochs=1,  # Reduced for testing
-        evaluation_strategy="steps",
-        eval_steps=50,       # More frequent evaluation
-        save_steps=100,      # More frequent saving
-        logging_dir="./logs",
-        logging_steps=10,    # More frequent logging
-        load_best_model_at_end=True,
-        metric_for_best_model="accuracy",
-        save_total_limit=2,
-        remove_unused_columns=False,
-        no_cuda=True,
-    )
-
-    # Initialize trainer
-    trainer = MambaDistillationTrainer(
-        model=student_model,
-        args=training_args,
-        train_dataset=processed_dataset,
-        eval_dataset=processed_eval_dataset,
-        tokenizer=tokenizer,
+    # Initialize distillation trainer
+    print("\nStarting distillation...")
+    distillation_trainer = OptimizedDistillationTrainer(
         teacher_model=teacher_model,
+        student_model=student_model,
+        train_dataloader=train_dataloader,
+        eval_dataloader=eval_dataloader,
+        num_epochs=3,
+        device=device,
+        learning_rate=1e-4,
+        gradient_accumulation_steps=2
     )
 
-    # Train the model
-    print("Starting training...")
-    trainer.train()
+    # Train student through distillation
+    distillation_trainer.train()
 
-    # Save the models
-    print("Saving models...")
-    os.makedirs(SAVE_DIR, exist_ok=True)
-    torch.save({
-        'model_state_dict': student_model.state_dict(),
-        'config': student_config.to_dict(),  # Save config as dict
-    }, os.path.join(SAVE_DIR, 'student_model.pth'))
-
-    # Test the models
+    # Test both models
     def predict_text(text, model, tokenizer, device):
         inputs = tokenizer(text, return_tensors="pt", padding=True, truncation=True)
         inputs = {k: v.to(device) for k, v in inputs.items()}
@@ -328,16 +465,21 @@ def main():
         
         return prediction.item(), probs[0].cpu().numpy()
 
-    # Test example
-    test_text = "I feel happy today!"
-    print("\nTesting models...")
-    print(f"Text: {test_text}")
-
-    teacher_pred, teacher_probs = predict_text(test_text, teacher_model, tokenizer, device)
-    student_pred, student_probs = predict_text(test_text, student_model, tokenizer, device)
-
-    print(f"Teacher prediction: {teacher_pred} (confidence: {teacher_probs[teacher_pred]:.4f})")
-    print(f"Student prediction: {student_pred} (confidence: {student_probs[student_pred]:.4f})")
+    # Test examples
+    test_texts = [
+        "I feel happy today!",
+        "This makes me so angry!",
+        "I'm really sad about what happened.",
+        "What an amazing surprise!"
+    ]
+    
+    print("\nTesting both models:")
+    for text in test_texts:
+        print(f"\nText: {text}")
+        teacher_pred, teacher_probs = predict_text(text, teacher_model, tokenizer, device)
+        student_pred, student_probs = predict_text(text, student_model, tokenizer, device)
+        print(f"Teacher prediction: {teacher_pred} (confidence: {teacher_probs[teacher_pred]:.4f})")
+        print(f"Student prediction: {student_pred} (confidence: {student_probs[student_pred]:.4f})")
 
 if __name__ == "__main__":
     main()
