@@ -17,16 +17,14 @@ from datasets import load_dataset
 
 # Constants
 MODEL_ID = "state-spaces/mamba-130m-hf"
-DATASET_NAME = "dair-ai/emotion"
-NUM_LABELS = 6
-SAVE_DIR = "./distilled_mamba_classifier"
-EMOTION_LABELS = {
-    0: "sadness",
-    1: "joy",
-    2: "love",
-    3: "anger",
-    4: "fear",
-    5: "surprise"
+DATASET_NAME = "sst2"  # Changed to SST-2
+NUM_LABELS = 2  # Changed to 2 for binary classification
+SAVE_DIR = "./distilled_mamba_sst2"
+
+# Label mapping for SST-2
+SENTIMENT_LABELS = {
+    0: "negative",
+    1: "positive"
 }
 
 # Device setup
@@ -65,10 +63,12 @@ class MambaForSequenceClassification(nn.Module):
         
         # Classification head
         self.classifier = nn.Sequential(
-            nn.Linear(self.hidden_size, self.hidden_size // 2),
-            nn.GELU(),
-            nn.Dropout(0.1),
-            nn.Linear(self.hidden_size // 2, num_labels)
+            # nn.Linear(self.hidden_size, self.hidden_size // 2),
+            # nn.GELU(),
+            # nn.Dropout(0.1),
+            # nn.Linear(self.hidden_size // 2, num_labels)
+            nn.Dropout(0.3),
+            nn.Linear(self.hidden_size, num_labels)
         )
         
         print(f"\nModel initialized with:")
@@ -134,15 +134,19 @@ class CustomDataset(torch.utils.data.Dataset):
 
 def create_dataset(dataset_name, tokenizer, split="train", max_length=64, use_subset=True):
     """Create a properly formatted dataset."""
-    # Load dataset
-    if use_subset:
-        dataset = load_dataset(dataset_name, split=f"{split}[:1%]")
-    else:
+    # Load dataset - use full eval set but subset of train
+    if split == "validation" or not use_subset:  # SST-2 uses 'validation' instead of 'test'
         dataset = load_dataset(dataset_name, split=split)
+    else:
+        # Only use subset for training data
+        dataset = load_dataset(dataset_name, split=f"{split}[:1%]")
+    
+    print(f"\nLoading {split} dataset:")
+    print(f"Number of examples: {len(dataset)}")
     
     # Tokenize texts
     encodings = tokenizer(
-        dataset["text"],
+        dataset["sentence"],  # SST-2 uses 'sentence' instead of 'text'
         padding='max_length',
         truncation=True,
         max_length=max_length,
@@ -152,7 +156,6 @@ def create_dataset(dataset_name, tokenizer, split="train", max_length=64, use_su
     # Get labels
     labels = dataset["label"]
     
-    # Create custom dataset
     return CustomDataset(encodings, labels)
 
 class OptimizedDistillationTrainer:
@@ -282,7 +285,7 @@ class OptimizedDistillationTrainer:
         print("\nPrediction distribution:")
         for label_id, count in label_counts.items():
             percentage = (count / total_samples) * 100
-            emotion = EMOTION_LABELS[label_id]
+            emotion = SENTIMENT_LABELS[label_id]
             print(f"{emotion}: {count} predictions ({percentage:.2f}%)")
         
         return accuracy
@@ -473,13 +476,13 @@ def perform_final_evaluation(teacher_model, student_model, eval_dataloader, devi
     total_samples = 0
     
     # Track predictions for both models
-    teacher_predictions = {i: 0 for i in EMOTION_LABELS.keys()}
-    student_predictions = {i: 0 for i in EMOTION_LABELS.keys()}
-    true_labels_dist = {i: 0 for i in EMOTION_LABELS.keys()}
+    teacher_predictions = {i: 0 for i in SENTIMENT_LABELS.keys()}
+    student_predictions = {i: 0 for i in SENTIMENT_LABELS.keys()}
+    true_labels_dist = {i: 0 for i in SENTIMENT_LABELS.keys()}
     
     # Track confusion matrices
-    teacher_confusion = {i: {j: 0 for j in EMOTION_LABELS.keys()} for i in EMOTION_LABELS.keys()}
-    student_confusion = {i: {j: 0 for j in EMOTION_LABELS.keys()} for i in EMOTION_LABELS.keys()}
+    teacher_confusion = {i: {j: 0 for j in SENTIMENT_LABELS.keys()} for i in SENTIMENT_LABELS.keys()}
+    student_confusion = {i: {j: 0 for j in SENTIMENT_LABELS.keys()} for i in SENTIMENT_LABELS.keys()}
     
     print("\nPerforming final evaluation...")
     with torch.no_grad():
@@ -487,20 +490,16 @@ def perform_final_evaluation(teacher_model, student_model, eval_dataloader, devi
             batch = {k: v.to(device) for k, v in batch.items()}
             labels = batch['labels']
             
-            # Teacher predictions
             teacher_outputs = teacher_model(**batch)
             teacher_preds = teacher_outputs.logits.argmax(dim=-1)
             
-            # Student predictions
             student_outputs = student_model(**batch)
             student_preds = student_outputs.logits.argmax(dim=-1)
             
-            # Update accuracy counts
             teacher_correct += (teacher_preds == labels).sum().item()
             student_correct += (student_preds == labels).sum().item()
             total_samples += labels.size(0)
             
-            # Update prediction distributions
             for pred in teacher_preds.cpu().numpy():
                 teacher_predictions[pred] += 1
             for pred in student_preds.cpu().numpy():
@@ -508,7 +507,6 @@ def perform_final_evaluation(teacher_model, student_model, eval_dataloader, devi
             for label in labels.cpu().numpy():
                 true_labels_dist[label] += 1
                 
-            # Update confusion matrices
             for true, t_pred, s_pred in zip(labels.cpu().numpy(), 
                                           teacher_preds.cpu().numpy(), 
                                           student_preds.cpu().numpy()):
@@ -529,31 +527,32 @@ def perform_final_evaluation(teacher_model, student_model, eval_dataloader, devi
     print("\nTrue Label Distribution:")
     for label_id, count in true_labels_dist.items():
         percentage = (count / total_samples) * 100
-        print(f"{EMOTION_LABELS[label_id]}: {count} samples ({percentage:.2f}%)")
+        print(f"{SENTIMENT_LABELS[label_id]}: {count} samples ({percentage:.2f}%)")
     
     print("\nTeacher Model Predictions:")
     for label_id, count in teacher_predictions.items():
         percentage = (count / total_samples) * 100
-        print(f"{EMOTION_LABELS[label_id]}: {count} predictions ({percentage:.2f}%)")
+        print(f"{SENTIMENT_LABELS[label_id]}: {count} predictions ({percentage:.2f}%)")
     
     print("\nStudent Model Predictions:")
     for label_id, count in student_predictions.items():
         percentage = (count / total_samples) * 100
-        print(f"{EMOTION_LABELS[label_id]}: {count} predictions ({percentage:.2f}%)")
+        print(f"{SENTIMENT_LABELS[label_id]}: {count} predictions ({percentage:.2f}%)")
     
     print("\nPer-Class Performance:")
-    for emotion_id in EMOTION_LABELS.keys():
-        emotion_name = EMOTION_LABELS[emotion_id]
-        true_count = true_labels_dist[emotion_id]
+    for sentiment_id in SENTIMENT_LABELS.keys():
+        sentiment_name = SENTIMENT_LABELS[sentiment_id]
+        true_count = true_labels_dist[sentiment_id]
         if true_count == 0:
             continue
             
-        teacher_correct = teacher_confusion[emotion_id][emotion_id]
-        student_correct = student_confusion[emotion_id][emotion_id]
+        teacher_correct = teacher_confusion[sentiment_id][sentiment_id]
+        student_correct = student_confusion[sentiment_id][sentiment_id]
         
-        print(f"\n{emotion_name}:")
+        print(f"\n{sentiment_name}:")
         print(f"Teacher accuracy: {teacher_correct/true_count:.4f}")
         print(f"Student accuracy: {student_correct/true_count:.4f}")
+
 
 def main():
     # Load tokenizer
@@ -565,8 +564,8 @@ def main():
 
     # Create datasets
     print("Creating datasets...")
-    train_dataset = create_dataset(DATASET_NAME, tokenizer, split="train")
-    eval_dataset = create_dataset(DATASET_NAME, tokenizer, split="test")
+    train_dataset = create_dataset(DATASET_NAME, tokenizer, split="train", use_subset=True)
+    eval_dataset = create_dataset(DATASET_NAME, tokenizer, split="validation", use_subset=True)
 
     # Create dataloaders
     train_dataloader = torch.utils.data.DataLoader(
@@ -586,7 +585,7 @@ def main():
     # Create teacher model
     print("Creating teacher model...")
     base_teacher = AutoModelForCausalLM.from_pretrained(MODEL_ID)
-    teacher_model = MambaForSequenceClassification(base_teacher, NUM_LABELS, freeze_base=False) # Freeze base model for faster training
+    teacher_model = MambaForSequenceClassification(base_teacher, NUM_LABELS, freeze_base=True)
     teacher_model = teacher_model.to(device)
     
     # Print teacher model's configuration
@@ -613,7 +612,7 @@ def main():
     
     # Compare model sizes
     compare_models(teacher_model, student_model)
-    
+
     def count_trainable_params(model, name):
         trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
         total = sum(p.numel() for p in model.parameters())
@@ -624,7 +623,7 @@ def main():
 
     count_trainable_params(teacher_model, "Teacher model")
     count_trainable_params(student_model, "Student model")
-
+    
     # Fine-tune teacher model
     print("\nFine-tuning teacher model...")
     teacher_trainer = TeacherTrainer(
@@ -661,77 +660,21 @@ def main():
     # Train student through distillation
     distillation_trainer.train()
 
-    # Test examples with emotion labels
     test_texts = [
-        "I feel happy today!",
-        "This makes me so angry!",
-        "I'm really sad about what happened.",
-        "What an amazing surprise!",
-        "I love you so much!",
-        "This is terrifying!"
+        "This movie was fantastic!",
+        "What a terrible waste of time.",
+        "A masterpiece of modern cinema.",
+        "I really didn't enjoy this film at all."
     ]
     
     print("\nTesting both models:")
     for text in test_texts:
         print(f"\nText: {text}")
-        
-        # Teacher prediction
         teacher_pred, teacher_probs = predict_text(text, teacher_model, tokenizer, device)
-        teacher_emotion = EMOTION_LABELS[teacher_pred]
-        print(f"Teacher prediction: {teacher_emotion} (confidence: {teacher_probs[teacher_pred]:.4f})")
-        print("Teacher probabilities for each emotion:")
-        for i, prob in enumerate(teacher_probs):
-            print(f"  {EMOTION_LABELS[i]}: {prob:.4f}")
-        
-        # Student prediction
         student_pred, student_probs = predict_text(text, student_model, tokenizer, device)
-        student_emotion = EMOTION_LABELS[student_pred]
-        print(f"Student prediction: {student_emotion} (confidence: {student_probs[student_pred]:.4f})")
-        print("Student probabilities for each emotion:")
-        for i, prob in enumerate(student_probs):
-            print(f"  {EMOTION_LABELS[i]}: {prob:.4f}")
-
-    # Print overall statistics
-    print("\nOverall Prediction Statistics:")
-    print("\nEvaluating Teacher Model...")
-    teacher_model.eval()
-    label_counts = {i: 0 for i in range(NUM_LABELS)}
-    total_samples = 0
-    
-    with torch.no_grad():
-        for batch in eval_dataloader:
-            batch = {k: v.to(device) for k, v in batch.items()}
-            outputs = teacher_model(**batch)
-            predictions = outputs.logits.argmax(dim=-1)
-            
-            for pred in predictions.cpu().numpy():
-                label_counts[pred] += 1
-            total_samples += predictions.size(0)
-    
-    print("\nTeacher Model Distribution:")
-    for label_id, count in label_counts.items():
-        percentage = (count / total_samples) * 100
-        emotion = EMOTION_LABELS[label_id]
-        print(f"{emotion}: {count} predictions ({percentage:.2f}%)")
-    
-    print("\nEvaluating Student Model...")
-    student_model.eval()
-    label_counts = {i: 0 for i in range(NUM_LABELS)}
-    
-    with torch.no_grad():
-        for batch in eval_dataloader:
-            batch = {k: v.to(device) for k, v in batch.items()}
-            outputs = student_model(**batch)
-            predictions = outputs.logits.argmax(dim=-1)
-            
-            for pred in predictions.cpu().numpy():
-                label_counts[pred] += 1
-    
-    print("\nStudent Model Distribution:")
-    for label_id, count in label_counts.items():
-        percentage = (count / total_samples) * 100
-        emotion = EMOTION_LABELS[label_id]
-        print(f"{emotion}: {count} predictions ({percentage:.2f}%)")
+        
+        print(f"Teacher prediction: {SENTIMENT_LABELS[teacher_pred]} (confidence: {teacher_probs[teacher_pred]:.4f})")
+        print(f"Student prediction: {SENTIMENT_LABELS[student_pred]} (confidence: {student_probs[student_pred]:.4f})")
     
     print("\nPerforming final comprehensive evaluation...")
     perform_final_evaluation(teacher_model, student_model, eval_dataloader, device)
