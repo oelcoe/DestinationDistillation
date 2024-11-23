@@ -55,7 +55,7 @@ class MambaForSequenceClassification(nn.Module):
             param.requires_grad = False
         
         # Get hidden size from model config
-        self.hidden_size = self.mamba.config.d_model
+        self.hidden_size = self.mamba.config.hidden_size
         
         # Create projection layer
         self.projection = nn.Linear(self.mamba.config.vocab_size, self.hidden_size)
@@ -71,7 +71,7 @@ class MambaForSequenceClassification(nn.Module):
         print(f"\nModel initialized with:")
         print(f"- Hidden size: {self.hidden_size}")
         print(f"- Vocab size: {self.mamba.config.vocab_size}")
-        print(f"- Number of layers: {self.mamba.config.n_layer}")
+        print(f"- Number of layers: {self.mamba.config.num_hidden_layers}")
         print("- Fine-tuning last 2 layers of base model + classifier")
     
     def forward(self, input_ids, attention_mask=None, labels=None):
@@ -297,7 +297,7 @@ class TeacherTrainer:
         eval_dataloader,
         num_epochs,
         device,
-        learning_rate=5e-5,  # Lower learning rate for fine-tuning
+        learning_rate=5e-4,  # Lower learning rate for fine-tuning
         weight_decay=0.01
     ):
         self.model = model.to(device)
@@ -453,11 +453,11 @@ def create_reduced_mamba_config(teacher_config):
     student_config = AutoConfig.from_pretrained(MODEL_ID)
     
     # Reduce all relevant dimensions
-    student_config.d_model = teacher_config.d_model // 2        # Hidden size
-    student_config.n_layer = max(1, teacher_config.n_layer // 2)  # Number of layers
-    student_config.d_state = teacher_config.d_state // 2        # State dimension
-    student_config.d_conv = max(4, teacher_config.d_conv // 2)  # Conv dimension
-    student_config.expand = max(1, teacher_config.expand // 2)  # Expansion factor
+    student_config.hidden_size = teacher_config.hidden_size // 2  # Hidden size
+    student_config.num_hidden_layers = max(1, teacher_config.num_hidden_layers // 4)  # Number of layers
+    # student_config.d_state = teacher_config.d_state // 2        # State dimension
+    # student_config.d_conv = max(4, teacher_config.d_conv // 2)  # Conv dimension
+    # student_config.expand = max(1, teacher_config.expand // 2)  # Expansion factor
     
     return student_config
 
@@ -497,11 +497,11 @@ def main():
     
     # Print teacher model's configuration
     print("\nTeacher Model Configuration:")
-    print(f"d_model: {base_teacher.config.d_model}")
-    print(f"n_layer: {base_teacher.config.n_layer}")
-    print(f"d_state: {base_teacher.config.d_state}")
-    print(f"d_conv: {base_teacher.config.d_conv}")
-    print(f"expand: {base_teacher.config.expand}")
+    print(f"hidden_size: {base_teacher.config.hidden_size}")
+    print(f"num_hidden_layers: {base_teacher.config.num_hidden_layers}")
+    # print(f"d_state: {base_teacher.config.d_state}")
+    # print(f"d_conv: {base_teacher.config.d_conv}")
+    # print(f"expand: {base_teacher.config.expand}")
     
     # Create properly reduced student model
     print("\nCreating student model...")
@@ -509,14 +509,13 @@ def main():
     base_student = AutoModelForCausalLM.from_config(student_config)
     student_model = MambaForSequenceClassification(base_student, NUM_LABELS)
     student_model = student_model.to(device)
-    
     # Print student model's configuration
     print("\nStudent Model Configuration:")
-    print(f"d_model: {base_student.config.d_model}")
-    print(f"n_layer: {base_student.config.n_layer}")
-    print(f"d_state: {base_student.config.d_state}")
-    print(f"d_conv: {base_student.config.d_conv}")
-    print(f"expand: {base_student.config.expand}")
+    print(f"hidden_size: {base_student.config.hidden_size}")
+    print(f"num_hidden_layers: {base_student.config.num_hidden_layers}")
+    # print(f"d_state: {base_student.config.d_state}")
+    # print(f"d_conv: {base_student.config.d_conv}")
+    # print(f"expand: {base_student.config.expand}")
     
     # Compare model sizes
     compare_models(teacher_model, student_model)
