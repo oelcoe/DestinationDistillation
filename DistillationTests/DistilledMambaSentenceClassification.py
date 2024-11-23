@@ -65,10 +65,12 @@ class MambaForSequenceClassification(nn.Module):
         
         # Classification head
         self.classifier = nn.Sequential(
-            nn.Linear(self.hidden_size, self.hidden_size // 2),
-            nn.GELU(),
-            nn.Dropout(0.1),
-            nn.Linear(self.hidden_size // 2, num_labels)
+            # nn.Linear(self.hidden_size, self.hidden_size // 2),
+            # nn.GELU(),
+            # nn.Dropout(0.1),
+            # nn.Linear(self.hidden_size // 2, num_labels)
+            nn.Dropout(0.3),
+            nn.Linear(self.hidden_size, num_labels)
         )
         
         print(f"\nModel initialized with:")
@@ -586,7 +588,7 @@ def main():
     # Create teacher model
     print("Creating teacher model...")
     base_teacher = AutoModelForCausalLM.from_pretrained(MODEL_ID)
-    teacher_model = MambaForSequenceClassification(base_teacher, NUM_LABELS, freeze_base=False) # Freeze base model for faster training
+    teacher_model = MambaForSequenceClassification(base_teacher, NUM_LABELS, freeze_base=True) # Freeze base model for faster training
     teacher_model = teacher_model.to(device)
     
     # Print teacher model's configuration
