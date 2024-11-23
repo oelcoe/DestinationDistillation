@@ -461,6 +461,98 @@ def create_reduced_mamba_config(teacher_config):
     
     return student_config
 
+def perform_final_evaluation(teacher_model, student_model, eval_dataloader, device):
+    """Perform comprehensive evaluation of both models on the entire eval set."""
+    teacher_model.eval()
+    student_model.eval()
+    
+    teacher_correct = 0
+    student_correct = 0
+    total_samples = 0
+    
+    # Track predictions for both models
+    teacher_predictions = {i: 0 for i in EMOTION_LABELS.keys()}
+    student_predictions = {i: 0 for i in EMOTION_LABELS.keys()}
+    true_labels_dist = {i: 0 for i in EMOTION_LABELS.keys()}
+    
+    # Track confusion matrices
+    teacher_confusion = {i: {j: 0 for j in EMOTION_LABELS.keys()} for i in EMOTION_LABELS.keys()}
+    student_confusion = {i: {j: 0 for j in EMOTION_LABELS.keys()} for i in EMOTION_LABELS.keys()}
+    
+    print("\nPerforming final evaluation...")
+    with torch.no_grad():
+        for batch in tqdm(eval_dataloader, desc="Evaluating"):
+            batch = {k: v.to(device) for k, v in batch.items()}
+            labels = batch['labels']
+            
+            # Teacher predictions
+            teacher_outputs = teacher_model(**batch)
+            teacher_preds = teacher_outputs.logits.argmax(dim=-1)
+            
+            # Student predictions
+            student_outputs = student_model(**batch)
+            student_preds = student_outputs.logits.argmax(dim=-1)
+            
+            # Update accuracy counts
+            teacher_correct += (teacher_preds == labels).sum().item()
+            student_correct += (student_preds == labels).sum().item()
+            total_samples += labels.size(0)
+            
+            # Update prediction distributions
+            for pred in teacher_preds.cpu().numpy():
+                teacher_predictions[pred] += 1
+            for pred in student_preds.cpu().numpy():
+                student_predictions[pred] += 1
+            for label in labels.cpu().numpy():
+                true_labels_dist[label] += 1
+                
+            # Update confusion matrices
+            for true, t_pred, s_pred in zip(labels.cpu().numpy(), 
+                                          teacher_preds.cpu().numpy(), 
+                                          student_preds.cpu().numpy()):
+                teacher_confusion[true][t_pred] += 1
+                student_confusion[true][s_pred] += 1
+    
+    # Calculate metrics
+    teacher_accuracy = teacher_correct / total_samples
+    student_accuracy = student_correct / total_samples
+    
+    # Print results
+    print("\n=== Final Evaluation Results ===")
+    print("\nOverall Accuracy:")
+    print(f"Teacher Model: {teacher_accuracy:.4f}")
+    print(f"Student Model: {student_accuracy:.4f}")
+    print(f"Accuracy Retention: {(student_accuracy/teacher_accuracy)*100:.2f}%")
+    
+    print("\nTrue Label Distribution:")
+    for label_id, count in true_labels_dist.items():
+        percentage = (count / total_samples) * 100
+        print(f"{EMOTION_LABELS[label_id]}: {count} samples ({percentage:.2f}%)")
+    
+    print("\nTeacher Model Predictions:")
+    for label_id, count in teacher_predictions.items():
+        percentage = (count / total_samples) * 100
+        print(f"{EMOTION_LABELS[label_id]}: {count} predictions ({percentage:.2f}%)")
+    
+    print("\nStudent Model Predictions:")
+    for label_id, count in student_predictions.items():
+        percentage = (count / total_samples) * 100
+        print(f"{EMOTION_LABELS[label_id]}: {count} predictions ({percentage:.2f}%)")
+    
+    print("\nPer-Class Performance:")
+    for emotion_id in EMOTION_LABELS.keys():
+        emotion_name = EMOTION_LABELS[emotion_id]
+        true_count = true_labels_dist[emotion_id]
+        if true_count == 0:
+            continue
+            
+        teacher_correct = teacher_confusion[emotion_id][emotion_id]
+        student_correct = student_confusion[emotion_id][emotion_id]
+        
+        print(f"\n{emotion_name}:")
+        print(f"Teacher accuracy: {teacher_correct/true_count:.4f}")
+        print(f"Student accuracy: {student_correct/true_count:.4f}")
+
 def main():
     # Load tokenizer
     print("Loading tokenizer...")
@@ -627,6 +719,9 @@ def main():
         percentage = (count / total_samples) * 100
         emotion = EMOTION_LABELS[label_id]
         print(f"{emotion}: {count} predictions ({percentage:.2f}%)")
+    
+    print("\nPerforming final comprehensive evaluation...")
+    perform_final_evaluation(teacher_model, student_model, eval_dataloader, device)
 
 def predict_text(text, model, tokenizer, device):
     inputs = tokenizer(text, return_tensors="pt", padding=True, truncation=True)
