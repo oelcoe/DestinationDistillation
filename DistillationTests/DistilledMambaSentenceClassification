@@ -1,0 +1,341 @@
+import os
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import numpy as np
+from tqdm import tqdm
+from sklearn.metrics import accuracy_score, f1_score, classification_report
+from transformers import (
+    AutoTokenizer, 
+    AutoModelForCausalLM,
+    AutoConfig,
+    TrainingArguments,
+    Trainer
+)
+from datasets import load_dataset
+
+# Constants
+MODEL_ID = "state-spaces/mamba-130m-hf"
+DATASET_NAME = "dair-ai/emotion"
+NUM_LABELS = 6
+SAVE_DIR = "./distilled_mamba_classifier"
+
+# Device setup
+def get_device():
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+    elif torch.backends.mps.is_available():
+        return torch.device("cpu")
+    else:
+        return torch.device("cpu")
+
+device = get_device()
+print(f"Using device: {device}")
+
+class MambaForSequenceClassification(nn.Module):
+    def __init__(self, base_model, num_labels, pooling_type='mean'):
+        super().__init__()
+        self.mamba = base_model
+        self.num_labels = num_labels
+        self.pooling_type = pooling_type
+        
+        # Get hidden size from model config
+        self.hidden_size = self.mamba.config.d_model
+        
+        # Project from vocab size to hidden size
+        self.projection = nn.Linear(self.mamba.config.vocab_size, self.hidden_size)
+        
+        # Classification head
+        self.classifier = nn.Sequential(
+            nn.Linear(self.hidden_size, self.hidden_size),
+            nn.GELU(),
+            nn.Dropout(0.1),
+            nn.Linear(self.hidden_size, num_labels)
+        )
+        
+        print(f"Model initialized with:")
+        print(f"- Hidden size: {self.hidden_size}")
+        print(f"- Vocab size: {self.mamba.config.vocab_size}")
+        print(f"- Projection: {self.mamba.config.vocab_size} -> {self.hidden_size}")
+        
+    def forward(self, input_ids, attention_mask=None, labels=None):
+        device = self.device
+        input_ids = input_ids.to(device)
+        if attention_mask is not None:
+            attention_mask = attention_mask.to(device)
+        if labels is not None:
+            labels = labels.to(device)
+            
+        # Get hidden states from Mamba
+        outputs = self.mamba(input_ids, attention_mask=attention_mask)
+        hidden_states = outputs.logits  # Shape: [batch_size, seq_len, vocab_size]
+        
+        # Debug shapes
+        if self.training and not hasattr(self, '_printed_shapes'):
+            print(f"\nDebug shapes in forward pass:")
+            print(f"Initial hidden states shape: {hidden_states.shape}")
+            self._printed_shapes = True
+            
+        # Apply pooling before projection
+        if self.pooling_type == 'mean':
+            if attention_mask is not None:
+                mask_expanded = attention_mask.unsqueeze(-1).float()
+                sum_hidden = torch.sum(hidden_states * mask_expanded, dim=1)
+                sum_mask = torch.sum(mask_expanded, dim=1)
+                pooled_output = sum_hidden / (sum_mask + 1e-9)
+            else:
+                pooled_output = torch.mean(hidden_states, dim=1)
+        elif self.pooling_type == 'max':
+            if attention_mask is not None:
+                mask_expanded = attention_mask.unsqueeze(-1).float()
+                hidden_states = hidden_states * mask_expanded - 1e9 * (1 - mask_expanded)
+            pooled_output = torch.max(hidden_states, dim=1)[0]
+        else:
+            pooled_output = hidden_states[:, -1]
+            
+        # Debug pooled shape
+        if self.training and not hasattr(self, '_printed_pooled'):
+            print(f"Pooled shape before projection: {pooled_output.shape}")
+            self._printed_pooled = True
+            
+        # Project from vocab size to hidden size
+        projected_output = self.projection(pooled_output)
+        
+        # Debug projected shape
+        if self.training and not hasattr(self, '_printed_projected'):
+            print(f"Projected output shape: {projected_output.shape}")
+            self._printed_projected = True
+            
+        # Apply classification head
+        logits = self.classifier(projected_output)
+        
+        # Calculate loss if labels are provided
+        loss = None
+        if labels is not None:
+            loss_fct = nn.CrossEntropyLoss()
+            loss = loss_fct(logits.view(-1, self.num_labels), labels.view(-1))
+        
+        return type('MambaSequenceClassifierOutput', (), {
+            'loss': loss,
+            'logits': logits,
+            'hidden_states': hidden_states
+        })
+
+    @property
+    def device(self):
+        return next(self.parameters()).device
+        
+    def to(self, device):
+        super().to(device)
+        self.mamba = self.mamba.to(device)
+        self.projection = self.projection.to(device)
+        self.classifier = self.classifier.to(device)
+        return self
+
+def create_student_model(teacher_model, num_labels):
+    """Create a properly sized student model."""
+    # Create a new config instead of copying
+    student_config = AutoConfig.from_pretrained(MODEL_ID)
+    
+    # Modify the config for student model
+    student_config.d_model = teacher_model.mamba.config.d_model // 2
+    student_config.n_layer = max(1, teacher_model.mamba.config.n_layer // 4)
+    
+    # Create base student model
+    base_student = AutoModelForCausalLM.from_config(student_config)
+    
+    # Create student model with same vocab size projection as teacher
+    student_model = MambaForSequenceClassification(
+        base_student, 
+        num_labels, 
+        pooling_type='mean'
+    )
+    
+    return student_model, student_config
+
+def distillation_loss(student_logits, teacher_logits, labels, temperature=2.0, alpha=0.5):
+    """Compute the distillation loss."""
+    if student_logits.size() != teacher_logits.size():
+        print(f"Warning: size mismatch - student: {student_logits.size()}, teacher: {teacher_logits.size()}")
+    
+    soft_targets = F.softmax(teacher_logits / temperature, dim=-1)
+    student_log_probs = F.log_softmax(student_logits / temperature, dim=-1)
+    soft_loss = -(soft_targets * student_log_probs).sum(dim=-1).mean()
+    hard_loss = F.cross_entropy(student_logits, labels)
+    return alpha * (temperature ** 2) * soft_loss + (1 - alpha) * hard_loss
+
+class MambaDistillationTrainer(Trainer):
+    def __init__(self, *args, teacher_model=None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.teacher_model = teacher_model
+        
+    def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
+        if self.teacher_model.device != model.device:
+            self.teacher_model = self.teacher_model.to(model.device)
+            
+        labels = inputs.pop("labels")
+        inputs = {k: v.to(model.device) for k, v in inputs.items()}
+        labels = labels.to(model.device)
+        
+        # Debug first batch
+        if not hasattr(self, '_printed_debug'):
+            print("\nDebugging first batch:")
+            print(f"Input shapes: {[(k, v.shape) for k, v in inputs.items()]}")
+            print(f"Labels shape: {labels.shape}")
+            self._printed_debug = True
+        
+        with torch.no_grad():
+            teacher_outputs = self.teacher_model(**inputs)
+        
+        student_outputs = model(**inputs)
+        
+        loss = distillation_loss(
+            student_outputs.logits,
+            teacher_outputs.logits,
+            labels,
+            temperature=2.0,
+            alpha=0.5
+        )
+        
+        inputs["labels"] = labels
+        
+        if return_outputs:
+            return loss, student_outputs
+        return loss
+
+    def compute_metrics(self, eval_preds):
+        """Compute classification metrics."""
+        predictions, labels = eval_preds
+        predictions = np.argmax(predictions, axis=1)
+        
+        return {
+            'accuracy': accuracy_score(labels, predictions),
+            'f1': f1_score(labels, predictions, average='weighted')
+        }
+
+def main():
+    # Load tokenizer
+    print("Loading tokenizer...")
+    tokenizer = AutoTokenizer.from_pretrained(MODEL_ID)
+
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+        tokenizer.pad_token_id = tokenizer.eos_token_id
+
+    # Create teacher model
+    print("Creating models...")
+    base_teacher = AutoModelForCausalLM.from_pretrained(MODEL_ID)
+    teacher_model = MambaForSequenceClassification(base_teacher, NUM_LABELS, pooling_type='mean')
+    teacher_model = teacher_model.to(device)
+    
+    # Create student model and get config
+    student_model, student_config = create_student_model(teacher_model, NUM_LABELS)
+    student_model = student_model.to(device)
+    
+    # Print model dimensions
+    print("\nTeacher model dimensions:")
+    print(f"Hidden size: {teacher_model.hidden_size}")
+    print("\nStudent model dimensions:")
+    print(f"Hidden size: {student_model.hidden_size}")
+
+    # Load and preprocess dataset
+    print("Loading dataset...")
+    dataset = load_dataset(DATASET_NAME, split="train")
+    eval_dataset = load_dataset(DATASET_NAME, split="test")
+
+    def preprocess_function(examples):
+        tokenized = tokenizer(
+            examples["text"],
+            padding='max_length',
+            truncation=True,
+            max_length=128,
+            return_tensors=None,
+            return_attention_mask=True
+        )
+        
+        # Make sure to convert labels to the correct format
+        tokenized["labels"] = examples["label"]
+        
+        return tokenized
+
+    processed_dataset = dataset.map(
+        preprocess_function,
+        batched=True,
+        remove_columns=['text'],
+        desc="Processing train dataset"
+    )
+
+    processed_eval_dataset = eval_dataset.map(
+        preprocess_function,
+        batched=True,
+        remove_columns=['text'],
+        desc="Processing eval dataset"
+    )
+
+    # Training arguments
+    training_args = TrainingArguments(
+        output_dir=SAVE_DIR,
+        per_device_train_batch_size=8,
+        per_device_eval_batch_size=8,
+        gradient_accumulation_steps=2,
+        learning_rate=1e-4,
+        num_train_epochs=3,
+        evaluation_strategy="steps",
+        eval_steps=100,
+        save_steps=500,
+        logging_dir="./logs",
+        logging_steps=50,
+        load_best_model_at_end=True,
+        metric_for_best_model="accuracy",
+        save_total_limit=2,
+        remove_unused_columns=False,
+        no_cuda=True,
+    )
+
+    # Initialize trainer
+    trainer = MambaDistillationTrainer(
+        model=student_model,
+        args=training_args,
+        train_dataset=processed_dataset,
+        eval_dataset=processed_eval_dataset,
+        tokenizer=tokenizer,
+        teacher_model=teacher_model,
+    )
+
+    # Train the model
+    print("Starting training...")
+    trainer.train()
+
+    # Save the models
+    print("Saving models...")
+    os.makedirs(SAVE_DIR, exist_ok=True)
+    torch.save({
+        'model_state_dict': student_model.state_dict(),
+        'config': student_config.to_dict(),  # Save config as dict
+    }, os.path.join(SAVE_DIR, 'student_model.pth'))
+
+    # Test the models
+    def predict_text(text, model, tokenizer, device):
+        inputs = tokenizer(text, return_tensors="pt", padding=True, truncation=True)
+        inputs = {k: v.to(device) for k, v in inputs.items()}
+        
+        with torch.no_grad():
+            outputs = model(**inputs)
+            probs = F.softmax(outputs.logits, dim=-1)
+            prediction = torch.argmax(probs, dim=-1)
+        
+        return prediction.item(), probs[0].cpu().numpy()
+
+    # Test example
+    test_text = "I feel happy today!"
+    print("\nTesting models...")
+    print(f"Text: {test_text}")
+
+    teacher_pred, teacher_probs = predict_text(test_text, teacher_model, tokenizer, device)
+    student_pred, student_probs = predict_text(test_text, student_model, tokenizer, device)
+
+    print(f"Teacher prediction: {teacher_pred} (confidence: {teacher_probs[teacher_pred]:.4f})")
+    print(f"Student prediction: {student_pred} (confidence: {student_probs[student_pred]:.4f})")
+
+if __name__ == "__main__":
+    main()
