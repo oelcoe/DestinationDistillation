@@ -667,19 +667,6 @@ def perform_final_evaluation(teacher_model, student_model, eval_dataloader, devi
         print(f"Student accuracy: {student_correct/true_count:.4f}")
 
 def main():
-    wandb.init(
-        project="mamba-emotion-distillation-j",
-        config={
-            "teacher_learning_rate": 5e-4,
-            "student_learning_rate": 1e-4,
-            "batch_size": BATCH_SIZE,
-            "num_labels": NUM_LABELS,
-            "teacher_layers": base_teacher.config.num_hidden_layers,
-            "student_layers": base_student.config.num_hidden_layers,
-            "teacher_hidden_size": base_teacher.config.hidden_size,
-            "student_hidden_size": base_student.config.hidden_size,
-        }
-    )
     # Load tokenizer
     print("Loading tokenizer...")
     tokenizer = AutoTokenizer.from_pretrained(MODEL_ID)
@@ -748,6 +735,20 @@ def main():
 
     count_trainable_params(teacher_model, "Teacher model")
     count_trainable_params(student_model, "Student model")
+    
+    wandb.init(
+        project="mamba-emotion-distillation-j",
+        config={
+            "teacher_learning_rate": 5e-4,
+            "student_learning_rate": 1e-4,
+            "batch_size": BATCH_SIZE,
+            "num_labels": NUM_LABELS,
+            "teacher_layers": base_teacher.config.num_hidden_layers,
+            "student_layers": base_student.config.num_hidden_layers,
+            "teacher_hidden_size": base_teacher.config.hidden_size,
+            "student_hidden_size": base_student.config.hidden_size,
+        }
+    )
 
     # Fine-tune teacher model
     print("\nFine-tuning teacher model...")
