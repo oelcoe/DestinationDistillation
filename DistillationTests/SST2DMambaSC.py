@@ -1,5 +1,6 @@
 import os
 import torch
+import wandb
 import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
@@ -174,6 +175,8 @@ class OptimizedDistillationTrainer:
         num_epochs,
         device,
         num_labels,
+        project_name="mamba-distillation",  # Added for wandb
+        experiment_name="sst2", 
         learning_rate=1e-4,
         weight_decay=0.01,
         gradient_accumulation_steps=1
@@ -186,7 +189,22 @@ class OptimizedDistillationTrainer:
         self.device = device
         self.gradient_accumulation_steps = gradient_accumulation_steps
         self.num_labels = num_labels
-        
+        # Initialize wandb
+        wandb.init(
+            project=project_name,
+            name=experiment_name,
+            config={
+                "learning_rate": learning_rate,
+                "weight_decay": weight_decay,
+                "num_epochs": num_epochs,
+                "batch_size": train_dataloader.batch_size,
+                "gradient_accumulation_steps": gradient_accumulation_steps,
+                "teacher_params": sum(p.numel() for p in teacher_model.parameters()),
+                "student_params": sum(p.numel() for p in student_model.parameters()),
+                "model_reduction": f"{sum(p.numel() for p in student_model.parameters()) / sum(p.numel() for p in teacher_model.parameters()):.2%}"
+            }
+        )
+
         # Optimizer
         self.optimizer = torch.optim.AdamW(
             student_model.parameters(),
@@ -229,7 +247,6 @@ class OptimizedDistillationTrainer:
             progress_bar = tqdm(self.train_dataloader, desc=f"Epoch {epoch+1}")
             
             for step, batch in enumerate(progress_bar):
-                # Move batch to device
                 batch = {k: v.to(self.device) for k, v in batch.items()}
                 
                 # Get teacher predictions
@@ -247,7 +264,6 @@ class OptimizedDistillationTrainer:
                 # Backward pass
                 loss.backward()
                 
-                # Gradient accumulation
                 if (step + 1) % self.gradient_accumulation_steps == 0:
                     torch.nn.utils.clip_grad_norm_(self.student_model.parameters(), 1.0)
                     self.optimizer.step()
@@ -255,46 +271,82 @@ class OptimizedDistillationTrainer:
                     self.optimizer.zero_grad()
                 
                 total_loss += loss.item() * self.gradient_accumulation_steps
-                progress_bar.set_postfix({'loss': total_loss / (step + 1)})
+                current_loss = total_loss / (step + 1)
+                current_lr = self.scheduler.get_last_lr()[0]
+                
+                # Update progress bar and log to wandb
+                progress_bar.set_postfix({
+                    'loss': f"{current_loss:.4f}",
+                    'lr': f"{current_lr:.2e}"
+                })
+                
+                # Log training metrics
+                wandb.log({
+                    "train/loss": current_loss,
+                    "train/learning_rate": current_lr,
+                    "train/step": epoch * len(self.train_dataloader) + step
+                })
             
             # Evaluation
-            eval_acc = self.evaluate()
-            print(f"Epoch {epoch+1} - Eval Accuracy: {eval_acc:.4f}")
+            eval_metrics = self.evaluate()
+            print(f"Epoch {epoch+1} - Eval Accuracy: {eval_metrics['accuracy']:.4f}")
+            
+            # Log evaluation metrics
+            wandb.log({
+                "eval/accuracy": eval_metrics["accuracy"],
+                "eval/teacher_accuracy": eval_metrics["teacher_accuracy"],
+                "eval/accuracy_retention": eval_metrics["accuracy_retention"],
+                "eval/epoch": epoch
+            })
             
             # Save best model
-            if eval_acc > best_eval_acc:
-                best_eval_acc = eval_acc
+            if eval_metrics['accuracy'] > best_eval_acc:
+                best_eval_acc = eval_metrics['accuracy']
                 self.save_model()
-    
+                
+                # Log best metrics
+                wandb.log({
+                    "best/accuracy": best_eval_acc,
+                    "best/epoch": epoch
+                })
+        
+        # Close wandb run
+        wandb.finish()
+
     def evaluate(self):
         self.student_model.eval()
-        total_correct = 0
+        self.teacher_model.eval()
+        
+        student_correct = 0
+        teacher_correct = 0
         total_samples = 0
-        label_counts = {i: 0 for i in range(self.num_labels)}  # Track predictions per class
         
         with torch.no_grad():
             for batch in self.eval_dataloader:
                 batch = {k: v.to(self.device) for k, v in batch.items()}
-                outputs = self.student_model(**batch)
-                predictions = outputs.logits.argmax(dim=-1)
                 
-                # Count predictions per class
-                for pred in predictions.cpu().numpy():
-                    label_counts[pred] += 1
+                # Teacher predictions
+                teacher_outputs = self.teacher_model(**batch)
+                teacher_preds = teacher_outputs.logits.argmax(dim=-1)
                 
-                total_correct += (predictions == batch['labels']).sum().item()
+                # Student predictions
+                student_outputs = self.student_model(**batch)
+                student_preds = student_outputs.logits.argmax(dim=-1)
+                
+                # Calculate accuracy
+                student_correct += (student_preds == batch['labels']).sum().item()
+                teacher_correct += (teacher_preds == batch['labels']).sum().item()
                 total_samples += batch['labels'].size(0)
         
-        accuracy = total_correct / total_samples
+        student_accuracy = student_correct / total_samples
+        teacher_accuracy = teacher_correct / total_samples
+        accuracy_retention = (student_accuracy / teacher_accuracy) * 100 if teacher_accuracy > 0 else 0
         
-        # Print distribution of predictions
-        print("\nPrediction distribution:")
-        for label_id, count in label_counts.items():
-            percentage = (count / total_samples) * 100
-            emotion = SENTIMENT_LABELS[label_id]
-            print(f"{emotion}: {count} predictions ({percentage:.2f}%)")
-        
-        return accuracy
+        return {
+            "accuracy": student_accuracy,
+            "teacher_accuracy": teacher_accuracy,
+            "accuracy_retention": accuracy_retention
+        }
     
     def save_model(self):
         os.makedirs(SAVE_DIR, exist_ok=True)
@@ -636,7 +688,7 @@ def main():
         model=teacher_model,
         train_dataloader=train_dataloader,
         eval_dataloader=eval_dataloader,
-        num_epochs=10,  # More epochs for fine-tuning
+        num_epochs=1,  # More epochs for fine-tuning
         device=device
     )
     
@@ -659,6 +711,8 @@ def main():
         num_epochs=3,
         device=device,
         num_labels=NUM_LABELS,
+        project_name="mamba-distillation",
+        experiment_name=f"sst2-student-{student_config.num_hidden_layers}layers",
         learning_rate=1e-4,
         gradient_accumulation_steps=2
     )
