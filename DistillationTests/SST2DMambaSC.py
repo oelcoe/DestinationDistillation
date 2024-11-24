@@ -59,7 +59,10 @@ class MambaForSequenceClassification(nn.Module):
         self.hidden_size = self.mamba.config.hidden_size
         
         # Create projection layer
-        self.projection = nn.Linear(self.mamba.config.vocab_size, self.hidden_size)
+        # Create projection layer
+        self.projection = nn.Sequential(
+           nn.Identity()
+        )
         
         # Classification head
         self.classifier = nn.Sequential(
@@ -67,8 +70,11 @@ class MambaForSequenceClassification(nn.Module):
             # nn.GELU(),
             # nn.Dropout(0.1),
             # nn.Linear(self.hidden_size // 2, num_labels)
-            nn.Dropout(0.3),
-            nn.Linear(self.hidden_size, num_labels)
+            # nn.Dropout(0.3),
+            # nn.Linear(self.hidden_size, num_labels)
+ 
+            nn.Linear(self.mamba.config.vocab_size, num_labels),
+            nn.Dropout(0.1)
         )
         
         print(f"\nModel initialized with:")
