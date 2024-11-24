@@ -19,6 +19,7 @@ from datasets import load_dataset
 MODEL_ID = "state-spaces/mamba-130m-hf"
 DATASET_NAME = "dair-ai/emotion"
 NUM_LABELS = 6
+BATCH_SIZE = 8
 SAVE_DIR = "./distilled_mamba_classifier"
 EMOTION_LABELS = {
     0: "sadness",
@@ -29,17 +30,21 @@ EMOTION_LABELS = {
     5: "surprise"
 }
 
+if torch.cuda.is_available():
+        print(f"CUDA available: {torch.cuda.is_available()}")
+        print(f"CUDA version: {torch.version.cuda}")
+        print(f"PyTorch CUDA version: {torch.backends.cudnn.version()}")
+else:
+    print("CUDA not available!")
+
 # Device setup
 def get_device():
     if torch.cuda.is_available():
         return torch.device("cuda")
-    elif torch.backends.mps.is_available():
-        return torch.device("cpu")
-    else:
-        return torch.device("cpu")
 
 device = get_device()
 print(f"Using device: {device}")
+
 
 class MambaForSequenceClassification(nn.Module):
     def __init__(self, base_model, num_labels, pooling_type='mean', freeze_base=False):  # Added freeze_base parameter
@@ -141,7 +146,7 @@ def create_dataset(dataset_name, tokenizer, split="train", max_length=64, use_su
     """Create a properly formatted dataset."""
     # Load dataset
     if use_subset:
-        dataset = load_dataset(dataset_name, split=f"{split}[:20%]")
+        dataset = load_dataset(dataset_name, split=f"{split}[:1%]")
     else:
         dataset = load_dataset(dataset_name, split=split)
     
@@ -570,20 +575,20 @@ def main():
 
     # Create datasets
     print("Creating datasets...")
-    train_dataset = create_dataset(DATASET_NAME, tokenizer, split="train")
-    eval_dataset = create_dataset(DATASET_NAME, tokenizer, split="test")
+    train_dataset = create_dataset(DATASET_NAME, tokenizer, split="train", use_subset=False)
+    eval_dataset = create_dataset(DATASET_NAME, tokenizer, split="test", use_subset=False)
 
     # Create dataloaders
     train_dataloader = torch.utils.data.DataLoader(
         train_dataset,
-        batch_size=8,
+        batch_size=BATCH_SIZE,
         shuffle=True,
         num_workers=0
     )
     
     eval_dataloader = torch.utils.data.DataLoader(
         eval_dataset,
-        batch_size=8,
+        batch_size=BATCH_SIZE,
         shuffle=False,
         num_workers=0
     )
@@ -591,7 +596,7 @@ def main():
     # Create teacher model
     print("Creating teacher model...")
     base_teacher = AutoModelForCausalLM.from_pretrained(MODEL_ID)
-    teacher_model = MambaForSequenceClassification(base_teacher, NUM_LABELS, freeze_base=True) # Freeze base model for faster training
+    teacher_model = MambaForSequenceClassification(base_teacher, NUM_LABELS, freeze_base=False) # Freeze base model for faster training
     teacher_model = teacher_model.to(device)
     
     # Print teacher model's configuration
