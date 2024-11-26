@@ -73,9 +73,9 @@ class MambaForSequenceClassification(nn.Module):
             # nn.Linear(self.hidden_size // 2, num_labels)
             # nn.Dropout(0.3),
             # nn.Linear(self.hidden_size, num_labels)
-
-            nn.Linear(self.mamba.config.vocab_size, num_labels),
             nn.Dropout(0.1)
+            nn.Linear(self.mamba.config.vocab_size, num_labels),
+
         )
 
         print(f"\nModel initialized with:")
@@ -630,14 +630,14 @@ def main():
         train_dataset,
         batch_size=8,
         shuffle=True,
-        num_workers=2
+        num_workers=0
     )
 
     eval_dataloader = torch.utils.data.DataLoader(
         eval_dataset,
         batch_size=16,
         shuffle=False,
-        num_workers=2
+        num_workers=0
     )
 
     # Create teacher model
